@@ -1,0 +1,126 @@
+name: ci
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Path-filter once so the downstream jobs can skip when nothing they care
+  # about changed. A skipped job reports as "skipped" and counts as passing
+  # for branch protection, so listing every job as a required check is safe.
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      java: ${{ steps.filter.outputs.java }}
+      ui: ${{ steps.filter.outputs.ui }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dorny/paths-filter@v4
+      id: filter
+      with:
+          # Default predicate-quantifier ("some") matches when ANY changed
+          # file hits ANY pattern in the filter — the semantics we want.
+          # The downstream jobs ALSO have `|| github.event_name == 'push'`
+          # so the merge commit to development always exercises everything.
+        filters: |
+          java:
+            - 'saiku-bom/**'
+            - 'saiku-core/**'
+            - 'saiku-webapp/**'
+            - 'saiku-launcher/**'
+            - 'saiku-proptest/**'
+            - 'lib/repo/**'
+            - 'pom.xml'
+            - '**/pom.xml'
+            # Any workflow file edit (ci.yml, release.yml, release-prep.yml,
+            # claude.yml, …) re-runs the build so branch-protected required
+            # jobs aren't silently skipped — a workflow-only PR otherwise
+            # sits as BLOCKED waiting for required checks that never fire.
+            - '.github/workflows/**'
+            - '.github/test-floors.json'
+          ui:
+            - 'saiku-ui/**'
+            - '.github/workflows/**'
+          docs:
+            - 'docs/**'
+            - 'README.md'
+            - 'CLAUDE.md'
+
+  build:
+    name: build (JDK 22, ubuntu-latest) [ubuntu-latest--x64]
+    needs: changes
+    if: needs.changes.outputs.java == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Set up JDK 22
+      uses: actions/setup-java@v6.0.1
+      with:
+        distribution: temurin
+        java-version: "22"
+        cache: maven
+      # The Spicule deps live across three GH Packages registries (mondrian-saiku,
+      # olap4j, olap4j-xmlaserver). setup-java only wires one <server>, so we
+      # write the full settings.xml ourselves. One PAT (read:packages) covers
+      # all three. GH_PACKAGES_TOKEN is a repo secret — the auto-issued
+      # GITHUB_TOKEN can't read packages across orgs.
+    - name: Configure Maven settings.xml
+      env:
+        GH_PACKAGES_USER: ${{ github.actor }}
+        GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+      run: |
+        mkdir -p ~/.m2
+        cat > ~/.m2/settings.xml <<EOF
+        <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+          <servers>
+            <server><id>github-mondrian-saiku</id><username>${GH_PACKAGES_USER}</username><password>${GH_PACKAGES_TOKEN}</password></server>
+            <server><id>github-olap4j</id><username>${GH_PACKAGES_USER}</username><password>${GH_PACKAGES_TOKEN}</password></server>
+            <server><id>github-olap4j-xmlaserver</id><username>${GH_PACKAGES_USER}</username><password>${GH_PACKAGES_TOKEN}</password></server>
+            <server><id>github-saiku-query</id><username>${GH_PACKAGES_USER}</username><password>${GH_PACKAGES_TOKEN}</password></server>
+            <server><id>github-ossie</id><username>${GH_PACKAGES_USER}</username><password>${GH_PACKAGES_TOKEN}</password></server>
+          </servers>
+        </settings>
+        EOF
+    - name: Check licence headers
+        # Presence-check only: the tree carries Spicule, OSBI, Stoellberger and
+        # Pentaho EPL headers that must not be homogenised, which is why Spotless's
+        # <licenseHeader> is not used here. See scripts/check-licence-headers.sh.
+      run: ./scripts/check-licence-headers.sh
+
+    - name: mvn verify
+        # spotless:check is bound to the verify phase by the root pom's
+        # <execution>, so `mvn verify` covers formatting too. A standalone
+        # `mvn spotless:check` would fail on saiku-bom (a pom-only module
+        # that doesn't have spotless plugin bound). Keep the single step.
+      run: mvn -B -ntp -DskipITs=false verify
+
+    - name: Verify test floors (saiku#8)
+        # Fails if any module's surefire test count drops below the floor
+        # declared in .github/test-floors.json. Catches accidental deletions
+        # of AI-query tests. Bump the floor explicitly when adding tests.
+      run: |
+        set -euo pipefail
+        FLOORS=.github/test-floors.json
+        fail=0
+        while IFS=$'\t' read -r module floor; do
+          reports="${module}/target/surefire-reports"
+          if [[ ! -d "$reports" ]]; then
+            echo "::error::No surefire-reports for ${module} — module did not run tests"
+            fail=1
+            continue
+          fi
+          total=$(grep -hoE 'tests="[0-9]+"' "${reports}"/TEST-*.xml \
+                    | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+          echo "  ${module}: ${total} tests (floor ${floor})"
+          if (( total < floor )); then
+            echo "::error::${module} test count ${total} below floor ${floor} — did you delete a test?"
+            fail=1
+          fi
+        done < <(jq -r '.modules | to_entries[] | "\(.key)\t\(.value)"' "$FLOORS")
+        exit "$fail"
+
+    timeout-minutes: 150
